@@ -86,6 +86,7 @@ TERMINAL_WARMUP_SECONDS = float(CONFIG.get("validator_terminal_warmup_seconds", 
 TERMINAL_RELAUNCH_COOLDOWN = 60.0
 
 IPC_TIMEOUT = -10005
+AUTH_FAILED = -6
 
 _terminal_proc: subprocess.Popen | None = None
 _terminal_launched_at: float | None = None
@@ -152,10 +153,20 @@ def _ensure_terminal_running() -> None:
     time.sleep(TERMINAL_WARMUP_SECONDS)
 
 
-def _initialize_terminal() -> tuple[bool, tuple]:
-    kwargs = {"timeout": INIT_TIMEOUT_MS}
+def _initialize_terminal(
+    login: int | None = None, password: str | None = None, server: str | None = None
+) -> tuple[bool, tuple]:
+    """Connect to the validator terminal, logging in as part of the same call.
+
+    Passing the credentials to initialize() rather than calling login() afterwards
+    is what makes this work on a terminal with no saved account: without them the
+    terminal never completes its connection and the handshake ends in IPC timeout.
+    """
+    kwargs: dict = {"timeout": INIT_TIMEOUT_MS}
     if VALIDATOR_TERMINAL_PATH:
         kwargs["path"] = VALIDATOR_TERMINAL_PATH
+    if login is not None:
+        kwargs.update(login=login, password=password, server=server)
 
     last_error: tuple = (0, "unknown")
     for attempt in range(1, INIT_ATTEMPTS + 1):
@@ -177,10 +188,18 @@ def _initialize_terminal() -> tuple[bool, tuple]:
             "MT5 initialize attempt %s/%s failed: %s", attempt, INIT_ATTEMPTS, last_error
         )
         mt5.shutdown()
+
+        # Bad credentials will never succeed on retry, and the user is waiting.
+        if _error_code(last_error) == AUTH_FAILED:
+            break
         if attempt < INIT_ATTEMPTS:
             time.sleep(INIT_RETRY_DELAY)
 
     return False, last_error
+
+
+def _error_code(err) -> int:
+    return err[0] if isinstance(err, (tuple, list)) and err else 0
 
 
 def _initialize_failure_message(code: int) -> str:
@@ -192,10 +211,23 @@ def _initialize_failure_message(code: int) -> str:
     return "MT5 terminal could not be initialized on the server."
 
 
+INVALID_CREDENTIALS_MESSAGE = (
+    "Invalid MT5 credentials or server. Please check login, password and server name."
+)
+
+
 def _validate_credentials(login: str, password: str, server: str) -> dict:
-    ok, err = _initialize_terminal()
+    try:
+        login_id = int(login)
+    except ValueError:
+        return {"success": False, "message": "Login must be a numeric MT5 account number."}
+
+    ok, err = _initialize_terminal(login_id, password, server)
     if not ok:
-        code = err[0] if isinstance(err, (tuple, list)) and err else 0
+        code = _error_code(err)
+        if code == AUTH_FAILED:
+            logger.info("Login rejected for %s@%s: %s", login_id, server, err)
+            return {"success": False, "message": INVALID_CREDENTIALS_MESSAGE, "error_code": code}
         return {
             "success": False,
             "message": _initialize_failure_message(code),
@@ -204,18 +236,29 @@ def _validate_credentials(login: str, password: str, server: str) -> dict:
         }
 
     try:
-        ok = mt5.login(int(login), password=password, server=server)
-        if not ok:
-            code, desc = mt5.last_error()
-            logger.info("Login failed for %s@%s: (%s) %s", login, server, code, desc)
+        info = mt5.account_info()
+
+        # The terminal is shared, so make sure we are reading the account we were
+        # asked about and not whichever one happened to be logged in already.
+        if info is None or int(info.login) != login_id:
+            if not mt5.login(login_id, password=password, server=server):
+                err = mt5.last_error()
+                logger.info("Login failed for %s@%s: %s", login_id, server, err)
+                return {
+                    "success": False,
+                    "message": INVALID_CREDENTIALS_MESSAGE,
+                    "error_code": _error_code(err),
+                }
+            info = mt5.account_info()
+
+        if info is None:
+            return {"success": False, "message": "Connected but could not read account information."}
+        if int(info.login) != login_id:
+            logger.error("Terminal reported account %s while validating %s", info.login, login_id)
             return {
                 "success": False,
-                "message": "Invalid MT5 credentials or server. Please check login, password and server name.",
+                "message": "Could not verify this account on the server. Please try again.",
             }
-
-        info = mt5.account_info()
-        if not info:
-            return {"success": False, "message": "Connected but could not read account information."}
 
         return {
             "success": True,
@@ -223,8 +266,6 @@ def _validate_credentials(login: str, password: str, server: str) -> dict:
             "balance": round(float(info.balance), 2),
             "message": "Connection verified successfully.",
         }
-    except ValueError:
-        return {"success": False, "message": "Login must be a numeric MT5 account number."}
     except Exception as exc:  # noqa: BLE001
         logger.exception("Validation error: %s", exc)
         return {"success": False, "message": "Unexpected error while validating the account."}
@@ -266,12 +307,19 @@ def health():
 
 @app.get("/diagnose")
 def diagnose():
-    """Local-only smoke test: can we reach the terminal at all, without credentials?
+    """Local-only readiness check for the terminal, without needing credentials.
 
     Run on the VPS: curl http://127.0.0.1:8787/diagnose
+
+    Note it deliberately does not call initialize(): a terminal with no saved
+    account only completes the handshake when credentials are supplied, so a
+    credential-less attempt would fail here even when validation works fine.
+    Use probe_initialize.py when you need to test the call itself.
     """
     if request.remote_addr not in ("127.0.0.1", "::1"):
         return jsonify({"success": False, "message": "Diagnostics are available from localhost only."}), 403
+
+    _ensure_terminal_running()
 
     report = {
         "python_64bit": sys.maxsize > 2**32,
@@ -279,19 +327,14 @@ def diagnose():
         "terminal_path_exists": bool(VALIDATOR_TERMINAL_PATH) and Path(VALIDATOR_TERMINAL_PATH).is_file(),
         **win_diagnostics.report(VALIDATOR_TERMINAL_PATH),
     }
-
-    with _mt5_lock:
-        ok, err = _initialize_terminal()
-        report["initialize"] = ok
-        if not ok:
-            report["last_error"] = str(err)
-            report["hints"] = win_diagnostics.ipc_timeout_hints(
-                VALIDATOR_TERMINAL_PATH, _package_version()
-            )
-        else:
-            info = mt5.terminal_info()
-            report["terminal_info"] = info._asdict() if info is not None else None
-            mt5.shutdown()
+    report["terminal_ready"] = any(
+        probe.get("opened") or probe.get("exists_but_busy")
+        for probe in report.get("mt5_pipe_probes", [])
+    )
+    if not report["terminal_ready"]:
+        report["hints"] = win_diagnostics.ipc_timeout_hints(
+            VALIDATOR_TERMINAL_PATH, _package_version()
+        )
 
     return jsonify(report)
 
@@ -330,15 +373,27 @@ def _startup_checks() -> None:
 
 
 def _warm_up() -> None:
+    """Start the terminal and confirm it is reachable.
+
+    Readiness is checked via the terminal's named pipe rather than initialize(),
+    because a validator terminal has no saved account and only completes the
+    handshake once a user's credentials are supplied.
+    """
     with _mt5_lock:
-        ok, err = _initialize_terminal()
-        if ok:
-            mt5.shutdown()
-            logger.info("Warm-up successful: MT5 terminal is reachable.")
-        else:
-            logger.error("Warm-up failed: %s", err)
-            for hint in win_diagnostics.ipc_timeout_hints(VALIDATOR_TERMINAL_PATH, _package_version()):
-                logger.error("  - %s", hint)
+        _ensure_terminal_running()
+        try:
+            probes = [win_diagnostics.probe_pipe(p) for p in win_diagnostics.mt5_pipes()]
+        except win_diagnostics.DiagnosticsError as exc:
+            logger.warning("Could not check terminal readiness: %s", exc)
+            return
+
+    if any(p.get("opened") or p.get("exists_but_busy") for p in probes):
+        logger.info("Warm-up successful: the MT5 terminal is running and reachable.")
+        return
+
+    logger.error("Warm-up failed: the MT5 terminal is not reachable.")
+    for hint in win_diagnostics.ipc_timeout_hints(VALIDATOR_TERMINAL_PATH, _package_version()):
+        logger.error("  - %s", hint)
 
 
 if __name__ == "__main__":

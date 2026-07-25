@@ -1,0 +1,1 @@
+{"agent_token": "t", "hmac_secret": "s", "validator_mt5_terminal_path": "C:\\does\\not\\exist\\terminal64.exe", "validator_init_attempts": 2, "validator_init_retry_seconds": 0, "validator_terminal_warmup_seconds": 0}

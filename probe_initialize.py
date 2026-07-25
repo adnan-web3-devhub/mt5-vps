@@ -7,14 +7,18 @@ or to the terminal build itself, and the fastest way to tell them apart is to tr
 the variants side by side against every terminal on the machine.
 
     python probe_initialize.py
-    python probe_initialize.py --login 123456 --password secret --server Broker-Live
+    python probe_initialize.py --login 123456 --server Broker-Live   # prompts for password
     python probe_initialize.py --timeout 20000
     python probe_initialize.py --dry-run     # list attempts without touching MT5
+
+Omit --password and it is prompted for, so it never lands in your shell history
+(and PowerShell never gets a chance to parse characters like & in it).
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 from pathlib import Path
 
@@ -66,8 +70,12 @@ def build_attempts(paths: list[str], args: argparse.Namespace) -> list[dict]:
     ]
 
     creds = {}
-    if args.login and args.password and args.server:
-        creds = {"login": int(args.login), "password": args.password, "server": args.server}
+    if args.login and args.server:
+        creds = {
+            "login": int(args.login),
+            "password": args.password or "",
+            "server": args.server,
+        }
 
     for path in paths:
         attempts.append({"label": f"path={path}", "kwargs": {"path": path, "timeout": args.timeout}})
@@ -148,7 +156,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", action="append", default=[], help="extra terminal64.exe to test")
     parser.add_argument("--login")
-    parser.add_argument("--password")
+    parser.add_argument(
+        "--password",
+        help="omit to be prompted, which keeps it out of shell history",
+    )
     parser.add_argument("--server")
     parser.add_argument(
         "--timeout",
@@ -158,6 +169,9 @@ def main() -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help="list attempts without calling MT5")
     args = parser.parse_args()
+
+    if args.login and args.server and not args.password and not args.dry_run:
+        args.password = getpass.getpass("MT5 password (not echoed): ")
 
     paths = _unique_existing([*args.path, *configured_paths(), *COMMON_TERMINAL_PATHS])
     if not paths:

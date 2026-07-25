@@ -122,7 +122,18 @@ X-Arbitrage-Signature: HMAC-SHA256(raw_body, hmac_secret)
 ### Troubleshooting `MT5 initialize failed: (-10005, 'IPC timeout')`
 
 The Python package could not talk to the terminal over its named pipe. It is a
-server-side problem, never a wrong user password. Check in this order:
+server-side problem, never a wrong user password.
+
+**First, the cause that is easy to mistake for a broken setup:** a terminal with no
+saved trading account never completes its connection, so a bare
+`mt5.initialize(path=...)` times out even though the terminal is running fine and
+its pipe is reachable. The credentials have to go *into* the `initialize()` call —
+which is what `_validate_credentials` does — rather than into a separate
+`mt5.login()` afterwards. A terminal that does have a saved account (like the one
+`agent.py` uses) connects without credentials, which is why the two behave
+differently on the same machine.
+
+If that is not it, check in this order:
 
 1. **Does the configured terminal exist?** `validator_mt5_terminal_path` must point
    at a real `terminal64.exe`. The default example path
@@ -183,13 +194,19 @@ side by side to find one that works:
 
 ```powershell
 python probe_initialize.py
-python probe_initialize.py --login 123456 --password secret --server Broker-Live
+python probe_initialize.py --login 123456 --server Broker-Live
 ```
+
+Omit `--password` and it is prompted for, so it stays out of your shell history and
+PowerShell never tries to parse characters like `&` in it.
 
 It tries `initialize()` with no path, with the configured path, with forward
 slashes, in portable mode, and with credentials passed inline, against every
 terminal it can find, and prints which variants succeed. `--dry-run` lists the
 attempts without touching MT5.
+
+Run it only when the scheduled `agent.py` jobs are idle: it connects to one
+terminal at a time and will disturb a master sync in progress.
 
 If every variant fails, the terminal itself is refusing IPC:
 
