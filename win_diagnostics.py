@@ -22,12 +22,26 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _TOKEN_QUERY = 0x0008
 _TOKEN_ELEVATION = 20
 
+_GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
+_OPEN_EXISTING = 3
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_ERROR_PIPE_BUSY = 231
+
 # Standard Win32 dialog class; an MT5 modal (account wizard, EULA, update) shows up as this.
 DIALOG_WINDOW_CLASS = "#32770"
 
 
+class DiagnosticsError(RuntimeError):
+    """A diagnostic query could not be completed (as opposed to returning 'nothing')."""
+
+
 def powershell_json(command: str, timeout: int = 25):
-    """Run a PowerShell one-liner that ends in ConvertTo-Json and parse the result."""
+    """Run a PowerShell one-liner ending in ConvertTo-Json and parse the result.
+
+    Returns None when the command produced no output. Raises DiagnosticsError if
+    the query itself failed, so an error can never be mistaken for a result.
+    """
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
@@ -36,22 +50,21 @@ def powershell_json(command: str, timeout: int = 25):
             timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return f"query failed: {exc}"
+        raise DiagnosticsError(f"query failed: {exc}") from exc
 
     output = (proc.stdout or "").strip()
     if not output:
         return None
     try:
         return json.loads(output)
-    except json.JSONDecodeError:
-        return f"unexpected output: {output[:200]}"
+    except json.JSONDecodeError as exc:
+        raise DiagnosticsError(f"unexpected output: {output[:200]}") from exc
 
 
-def _as_list(parsed) -> list | str:
+def _as_list(parsed) -> list:
+    """ConvertTo-Json collapses a single result to a scalar; restore the list."""
     if parsed is None:
         return []
-    if isinstance(parsed, str):
-        return parsed
     return parsed if isinstance(parsed, list) else [parsed]
 
 
@@ -100,7 +113,7 @@ def process_elevated(pid: int) -> bool | None:
         return None
 
 
-def running_terminals(process_name: str = TERMINAL_PROCESS_NAME) -> list[dict] | str:
+def running_terminals(process_name: str = TERMINAL_PROCESS_NAME) -> list[dict]:
     """Live terminals with the attributes that decide whether the pipe is reachable."""
     terminals = _as_list(
         powershell_json(
@@ -111,9 +124,6 @@ def running_terminals(process_name: str = TERMINAL_PROCESS_NAME) -> list[dict] |
             "| ConvertTo-Json -Compress"
         )
     )
-    if isinstance(terminals, str):
-        return terminals
-
     for terminal in terminals:
         pid = terminal.get("ProcessId")
         if isinstance(pid, int):
@@ -122,10 +132,8 @@ def running_terminals(process_name: str = TERMINAL_PROCESS_NAME) -> list[dict] |
     return terminals
 
 
-def _notable_windows(windows: list[dict] | str) -> list[dict] | str:
+def _notable_windows(windows: list[dict]) -> list[dict]:
     """Drop the dozens of invisible helper windows every GUI app owns."""
-    if isinstance(windows, str):
-        return windows
     return [
         w
         for w in windows
@@ -133,15 +141,15 @@ def _notable_windows(windows: list[dict] | str) -> list[dict] | str:
     ]
 
 
-def process_windows(pid: int) -> list[dict] | str:
+def process_windows(pid: int) -> list[dict]:
     """Top-level windows owned by a process, to spot a blocking modal dialog.
 
     Only sees windows on the caller's own desktop, which is exactly the condition
     the MT5 pipe also requires.
     """
+    found: list[dict] = []
     try:
         user32 = ctypes.windll.user32
-        found: list[dict] = []
         callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         def on_window(hwnd, _lparam):
@@ -164,16 +172,16 @@ def process_windows(pid: int) -> list[dict] | str:
             return True
 
         user32.EnumWindows(callback_type(on_window), 0)
-        return found
     except (AttributeError, OSError) as exc:
-        return f"window list unavailable: {exc}"
+        raise DiagnosticsError(f"window list unavailable: {exc}") from exc
+    return found
 
 
-def mt5_pipes() -> list[str] | str:
+def mt5_pipes() -> list[str]:
     """Named pipes that look like MetaTrader's.
 
-    A terminal that has finished starting publishes one. If none exists the
-    terminal is up but not ready, so no client could ever connect.
+    A terminal that has finished starting publishes one. If none exists, the
+    terminal is up but not ready, so no client could connect.
     """
     pipes = _as_list(
         powershell_json(
@@ -181,9 +189,45 @@ def mt5_pipes() -> list[str] | str:
             "| Where-Object { $_ -match 'MT5|MetaTrader|MQL' } | ConvertTo-Json -Compress"
         )
     )
-    if isinstance(pipes, str):
-        return pipes
     return [str(p) for p in pipes]
+
+
+def probe_pipe(name: str) -> dict:
+    """Try to open a named pipe, to separate 'not reachable' from 'not answering'.
+
+    Opens and immediately closes one pipe instance. If this succeeds, the pipe is
+    reachable from here and any IPC timeout is in the protocol handshake above it
+    rather than in Windows permissions.
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        handle = kernel32.CreateFileW(
+            name, _GENERIC_READ | _GENERIC_WRITE, 0, None, _OPEN_EXISTING, 0, None
+        )
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            code = ctypes.get_last_error() or kernel32.GetLastError()
+            return {
+                "pipe": name,
+                "opened": False,
+                "error_code": int(code),
+                "error": ctypes.FormatError(int(code)).strip(),
+                # A busy pipe still proves it exists and permits us.
+                "exists_but_busy": int(code) == _ERROR_PIPE_BUSY,
+            }
+        kernel32.CloseHandle(handle)
+        return {"pipe": name, "opened": True}
+    except (AttributeError, OSError) as exc:
+        return {"pipe": name, "opened": False, "error": str(exc)}
 
 
 def file_version(path: str) -> str | None:
@@ -194,25 +238,29 @@ def file_version(path: str) -> str | None:
     )
     if isinstance(result, dict):
         return result.get("FileVersion") or result.get("ProductVersion")
-    return result if isinstance(result, str) else None
+    return None
 
 
 def build_number(version: str | None) -> int | None:
-    """Terminal build from a file version like '5.0.0.6061' -> 6061."""
+    """Terminal build from a version like '5.0.0.6061' -> 6061."""
     if not version:
         return None
-    parts = [p for p in version.replace(",", ".").split(".") if p.strip().isdigit()]
+    parts = [p for p in str(version).replace(",", ".").split(".") if p.strip().isdigit()]
     return int(parts[-1]) if parts else None
 
 
-def ipc_timeout_hints(terminal_path: str | None) -> list[str]:
+def ipc_timeout_hints(terminal_path: str | None, package_version: str | None = None) -> list[str]:
     """The specific, evidence-backed reasons the pipe is unreachable."""
+    try:
+        return _ipc_timeout_hints(terminal_path, package_version)
+    except DiagnosticsError as exc:
+        return [f"Diagnostics incomplete: {exc}"]
+
+
+def _ipc_timeout_hints(terminal_path: str | None, package_version: str | None) -> list[str]:
     hints: list[str] = []
     session = session_info()
     terminals = running_terminals()
-
-    if isinstance(terminals, str):
-        return [terminals]
 
     if not terminals:
         return [
@@ -252,25 +300,28 @@ def ipc_timeout_hints(terminal_path: str | None) -> list[str]:
     # Only a genuine mismatch matters; both elevated or both not is fine.
     our_elevation = session.get("elevated")
     if our_elevation is not None:
-        mismatched = [t for t in ours if t.get("Elevated") is not None and t["Elevated"] != our_elevation]
+        mismatched = [
+            t for t in ours if t.get("Elevated") is not None and t["Elevated"] != our_elevation
+        ]
         if mismatched:
             hints.append(
-                f"Elevation mismatch: the validator is {'elevated' if our_elevation else 'not elevated'} "
-                f"but terminal PID {mismatched[0].get('ProcessId')} is not. Integrity level blocks "
-                "the pipe - start both the same way."
+                f"Elevation mismatch: the validator is "
+                f"{'elevated' if our_elevation else 'not elevated'} but terminal PID "
+                f"{mismatched[0].get('ProcessId')} is not. Integrity level blocks the pipe - "
+                "start both the same way."
             )
 
-    build = build_number(file_version(terminal_path)) if terminal_path else None
-    if build is not None and build < MIN_IPC_BUILD:
+    terminal_build = build_number(file_version(terminal_path)) if terminal_path else None
+    if terminal_build is not None and terminal_build < MIN_IPC_BUILD:
         hints.append(
-            f"Terminal build {build} is older than {MIN_IPC_BUILD} and has no Python IPC support."
+            f"Terminal build {terminal_build} is older than {MIN_IPC_BUILD} and has no Python "
+            "IPC support."
         )
 
     dialogs = [
         w
         for t in ours
-        if isinstance(t.get("Windows"), list)
-        for w in t["Windows"]
+        for w in t.get("Windows", [])
         if w.get("class") == DIALOG_WINDOW_CLASS and w.get("visible")
     ]
     if dialogs:
@@ -280,40 +331,94 @@ def ipc_timeout_hints(terminal_path: str | None) -> list[str]:
         )
 
     pipes = mt5_pipes()
-    if isinstance(pipes, str):
-        hints.append(f"Could not enumerate named pipes: {pipes}")
-    elif not pipes:
+    if not pipes:
         hints.append(
             "The terminal has not published a named pipe, so it never finished starting. "
             "Open it on the desktop, complete any first-run dialog, log into an account with "
             "'Save account information', and wait for a ping in the status bar."
         )
-    else:
+        return hints
+
+    probes = [probe_pipe(p) for p in pipes]
+    reachable = [p for p in probes if p.get("opened") or p.get("exists_but_busy")]
+    if not reachable:
         hints.append(
-            f"Named pipes exist ({pipes}) but the connection still timed out, which points at "
-            "permissions/integrity rather than terminal readiness."
+            f"The terminal's pipe exists but cannot be opened from here: {probes}. "
+            "That is a permissions/integrity problem rather than terminal readiness."
         )
+        return hints
+
+    hints.append(
+        f"The terminal is ready and its pipe is reachable ({[p['pipe'] for p in reachable]}), "
+        "so Windows is not the problem: the terminal is refusing the IPC handshake."
+    )
+
+    package_build = build_number(package_version)
+    if package_build is not None and terminal_build is not None and package_build < terminal_build:
+        hints.append(
+            f"The package is build {package_build} and the terminal is build {terminal_build}. "
+            f"If pip has nothing newer than {package_version}, the package is not the problem - "
+            "the terminal is simply a newer/customised build."
+        )
+
+    hints.append(
+        "In the terminal, check Tools > Options > Community for a Python integration option and "
+        "enable it, then restart the terminal."
+    )
+    hints.append(
+        "Broker-customised terminals are sometimes built with IPC disabled. Install the original "
+        "terminal from https://www.metatrader5.com/en/download, point "
+        "validator_mt5_terminal_path at it, and add the broker's server inside it."
+    )
+    hints.append(
+        "To find a call that does work, run: python probe_initialize.py"
+    )
 
     return hints
 
 
 def report(terminal_path: str | None) -> dict:
-    version = file_version(terminal_path) if terminal_path else None
-    return {
-        "terminal_path": terminal_path,
-        "terminal_version": version,
-        "terminal_build": build_number(version),
-        "validator_session": session_info(),
-        "running_terminals": running_terminals(),
-        "mt5_pipes": mt5_pipes(),
-    }
+    """Everything above, tolerant of individual queries failing."""
+    data: dict = {"terminal_path": terminal_path}
+
+    try:
+        version = file_version(terminal_path) if terminal_path else None
+        data["terminal_version"] = version
+        data["terminal_build"] = build_number(version)
+    except DiagnosticsError as exc:
+        data["terminal_version_error"] = str(exc)
+
+    data["validator_session"] = session_info()
+
+    try:
+        data["running_terminals"] = running_terminals()
+    except DiagnosticsError as exc:
+        data["running_terminals_error"] = str(exc)
+
+    try:
+        pipes = mt5_pipes()
+        data["mt5_pipes"] = pipes
+        data["mt5_pipe_probes"] = [probe_pipe(p) for p in pipes]
+    except DiagnosticsError as exc:
+        data["mt5_pipes_error"] = str(exc)
+
+    return data
 
 
 if __name__ == "__main__":
     import sys
 
     path = sys.argv[1] if len(sys.argv) > 1 else None
-    print(json.dumps(report(path), indent=2, default=str))
+
+    package_version = None
+    try:
+        import MetaTrader5
+
+        package_version = getattr(MetaTrader5, "__version__", None)
+    except ImportError:
+        pass
+
+    print(json.dumps({**report(path), "mt5_package_version": package_version}, indent=2, default=str))
     print()
-    for hint in ipc_timeout_hints(path):
+    for hint in ipc_timeout_hints(path, package_version):
         print("-", hint)

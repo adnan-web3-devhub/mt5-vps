@@ -168,9 +168,42 @@ MetaTrader named pipes currently published, the raw `last_error()` from a real
 see. The same hints are written to the log on a failed warm-up. Failed `/validate`
 responses carry `error_code` / `error_detail`.
 
-The pipe list is the most decisive field: **no MetaTrader pipe means the terminal
-is running but never finished starting**, so no client of any kind could connect,
-and the fix is at the terminal window rather than in this service.
+The pipe fields are the most decisive:
+
+| Pipe state | Meaning | Where the fix is |
+|---|---|---|
+| No MetaTrader pipe | Terminal is up but never finished starting | The terminal window: dismiss dialogs, log in |
+| Pipe exists, cannot be opened | Permissions / integrity level | Match session, user and elevation |
+| Pipe opens fine | Windows is not involved; the terminal refuses the handshake | The terminal build (see below) |
+
+### When the pipe opens but `initialize()` still times out
+
+At that point Windows, Python and the package are all ruled out, so try the calls
+side by side to find one that works:
+
+```powershell
+python probe_initialize.py
+python probe_initialize.py --login 123456 --password secret --server Broker-Live
+```
+
+It tries `initialize()` with no path, with the configured path, with forward
+slashes, in portable mode, and with credentials passed inline, against every
+terminal it can find, and prints which variants succeed. `--dry-run` lists the
+attempts without touching MT5.
+
+If every variant fails, the terminal itself is refusing IPC:
+
+1. In the terminal, **Tools → Options → Community**, enable the Python integration
+   option if present, and restart the terminal.
+2. Broker-customised terminals are sometimes built with IPC disabled. Install the
+   original terminal from <https://www.metatrader5.com/en/download>, point
+   `validator_mt5_terminal_path` at it, and add the broker's server inside it. If
+   it cannot find the server, copy `servers.dat` (or the whole `config` folder)
+   from the broker's installation.
+
+Note that `pip install --upgrade MetaTrader5` is not a fix when you are already on
+the newest release; the package tracks terminal builds loosely and a terminal
+newer than any published package is expected to work.
 
 The same checks run standalone, without Flask or a validation request:
 

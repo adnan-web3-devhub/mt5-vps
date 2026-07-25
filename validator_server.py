@@ -108,6 +108,10 @@ def _authorized(raw_body: bytes) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+def _package_version() -> str | None:
+    return getattr(mt5, "__version__", None)
+
+
 def _ensure_terminal_running() -> None:
     """Start the validator terminal ourselves so initialize() only has to attach.
 
@@ -271,7 +275,7 @@ def diagnose():
 
     report = {
         "python_64bit": sys.maxsize > 2**32,
-        "mt5_package_version": getattr(mt5, "__version__", "unknown"),
+        "mt5_package_version": _package_version(),
         "terminal_path_exists": bool(VALIDATOR_TERMINAL_PATH) and Path(VALIDATOR_TERMINAL_PATH).is_file(),
         **win_diagnostics.report(VALIDATOR_TERMINAL_PATH),
     }
@@ -281,7 +285,9 @@ def diagnose():
         report["initialize"] = ok
         if not ok:
             report["last_error"] = str(err)
-            report["hints"] = win_diagnostics.ipc_timeout_hints(VALIDATOR_TERMINAL_PATH)
+            report["hints"] = win_diagnostics.ipc_timeout_hints(
+                VALIDATOR_TERMINAL_PATH, _package_version()
+            )
         else:
             info = mt5.terminal_info()
             report["terminal_info"] = info._asdict() if info is not None else None
@@ -331,7 +337,7 @@ def _warm_up() -> None:
             logger.info("Warm-up successful: MT5 terminal is reachable.")
         else:
             logger.error("Warm-up failed: %s", err)
-            for hint in win_diagnostics.ipc_timeout_hints(VALIDATOR_TERMINAL_PATH):
+            for hint in win_diagnostics.ipc_timeout_hints(VALIDATOR_TERMINAL_PATH, _package_version()):
                 logger.error("  - %s", hint)
 
 
