@@ -38,6 +38,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -55,7 +56,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("validator")
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
+# MT5_VALIDATOR_CONFIG lets tests and second instances point elsewhere, so nothing
+# ever has to write over the real config.json.
+CONFIG_PATH = Path(os.environ.get("MT5_VALIDATOR_CONFIG") or Path(__file__).parent / "config.json")
 
 app = Flask(__name__)
 _mt5_lock = threading.Lock()
@@ -339,7 +342,29 @@ def diagnose():
     return jsonify(report)
 
 
+PLACEHOLDER_SECRETS = {"t", "s", "your-agent-token", "your-hmac-secret", "changeme"}
+MIN_SECRET_LENGTH = 16
+
+
+def _check_credentials_configured() -> None:
+    """Catch a placeholder config here, not as unexplained 401s from Laravel."""
+    for name, value in (("agent_token", AGENT_TOKEN), ("hmac_secret", HMAC_SECRET)):
+        if not value:
+            logger.error("%s is missing from %s. Every request will be rejected.", name, CONFIG_PATH)
+        elif value.lower() in PLACEHOLDER_SECRETS or len(value) < MIN_SECRET_LENGTH:
+            logger.error(
+                "%s in %s looks like a placeholder (%d characters). It must match the value in "
+                "Laravel (Admin > Site Settings > Arbitrage), otherwise Laravel gets 401 on every "
+                "validation.",
+                name,
+                CONFIG_PATH,
+                len(value),
+            )
+
+
 def _startup_checks() -> None:
+    _check_credentials_configured()
+
     if sys.maxsize <= 2**32:
         logger.error(
             "This is 32-bit Python. The MetaTrader5 package needs 64-bit Python to talk to "

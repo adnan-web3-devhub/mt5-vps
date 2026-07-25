@@ -30,19 +30,21 @@ COMMON_TERMINAL_PATHS = [
 ]
 
 
-def configured_paths() -> list[str]:
-    paths: list[str] = []
-    if CONFIG_PATH.exists():
-        try:
-            with CONFIG_PATH.open("r", encoding="utf-8") as handle:
-                config = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            config = {}
-        for key in ("validator_mt5_terminal_path", "mt5_terminal_path"):
-            value = config.get(key)
-            if value:
-                paths.append(str(value))
-    return paths
+VALIDATOR_KEY = "validator_mt5_terminal_path"
+MASTER_KEY = "mt5_terminal_path"
+
+
+def configured_terminals() -> dict[str, str]:
+    """Terminal paths from config.json, keyed so we know which role each one plays."""
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"WARNING: could not read {CONFIG_PATH.name}: {exc}\n")
+        return {}
+    return {key: str(config[key]) for key in (VALIDATOR_KEY, MASTER_KEY) if config.get(key)}
 
 
 def _unique_existing(paths: list[str]) -> list[str]:
@@ -58,6 +60,10 @@ def _unique_existing(paths: list[str]) -> list[str]:
             lowered.add(key)
             result.append(path)
     return result
+
+
+def _same_path(left: str | None, right: str | None) -> bool:
+    return bool(left) and bool(right) and str(left).lower() == str(right).lower()
 
 
 def build_attempts(paths: list[str], args: argparse.Namespace) -> list[dict]:
@@ -78,18 +84,22 @@ def build_attempts(paths: list[str], args: argparse.Namespace) -> list[dict]:
         }
 
     for path in paths:
-        attempts.append({"label": f"path={path}", "kwargs": {"path": path, "timeout": args.timeout}})
+        attempts.append(
+            {"label": f"path={path}", "path": path, "kwargs": {"path": path, "timeout": args.timeout}}
+        )
         forward = path.replace("\\", "/")
         if forward != path:
             attempts.append(
                 {
                     "label": f"path with forward slashes={forward}",
+                    "path": path,
                     "kwargs": {"path": forward, "timeout": args.timeout},
                 }
             )
         attempts.append(
             {
                 "label": f"path={path} portable=True",
+                "path": path,
                 "kwargs": {"path": path, "portable": True, "timeout": args.timeout},
             }
         )
@@ -97,6 +107,7 @@ def build_attempts(paths: list[str], args: argparse.Namespace) -> list[dict]:
             attempts.append(
                 {
                     "label": f"path={path} with credentials in initialize()",
+                    "path": path,
                     "kwargs": {"path": path, "timeout": args.timeout, **creds},
                 }
             )
@@ -173,7 +184,18 @@ def main() -> int:
     if args.login and args.server and not args.password and not args.dry_run:
         args.password = getpass.getpass("MT5 password (not echoed): ")
 
-    paths = _unique_existing([*args.path, *configured_paths(), *COMMON_TERMINAL_PATHS])
+    configured = configured_terminals()
+    validator_path = configured.get(VALIDATOR_KEY)
+    master_path = configured.get(MASTER_KEY)
+
+    # A configured path that no longer exists would otherwise be skipped in silence,
+    # making a moved or renamed terminal look like one that was never set up.
+    for key, path in configured.items():
+        if not Path(path).is_file():
+            print(f"WARNING: config.json {key} = {path}")
+            print("         That file does not exist, so it cannot be tested.\n")
+
+    paths = _unique_existing([*args.path, *configured.values(), *COMMON_TERMINAL_PATHS])
     if not paths:
         print("No terminal64.exe found from --path, config.json or the common install paths.")
 
@@ -194,7 +216,23 @@ def main() -> int:
         print("Working call(s):")
         for result in working:
             print(f"  - {result['label']}")
-        print("\nUse the first one in validator_server.py / config.json.")
+
+        on_validator = [r for r in working if _same_path(r.get("path"), validator_path)]
+        on_master_only = not on_validator and any(
+            _same_path(r.get("path"), master_path) for r in working
+        )
+
+        if on_validator:
+            print(f"\nUse this one, against the dedicated validator terminal:\n  {on_validator[0]['label']}")
+        elif on_master_only:
+            print(
+                "\nNOTE: the only working calls use the master terminal "
+                f"({master_path}),\nwhich agent.py sync/weekly rely on. Validating users through it "
+                "would log the\nmaster accounts out mid-job. Get the dedicated validator terminal "
+                "working instead\nand point validator_mt5_terminal_path at it."
+            )
+        else:
+            print("\nUse the first one in validator_server.py / config.json.")
     else:
         print("Every variant failed.")
         print(

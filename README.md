@@ -21,6 +21,13 @@ It also ships a small **validation service** (`validator_server.py`) so users ca
    ```powershell
    copy config.example.json config.json
    ```
+
+   `config.json` holds live secrets and is gitignored. Never copy it between
+   machines along with the code, and keep a backup of the VPS copy — overwriting it
+   with an example or test version makes Laravel fail every validation with 401.
+   The validator logs a loud error at startup if the token or secret looks like a
+   placeholder. To run against a different config without touching this one, set
+   `MT5_VALIDATOR_CONFIG` to its path.
 4. Edit `config.json`:
    - `laravel_api_url`: e.g. `https://yourdomain.com/api/arbitrage`
    - `agent_token`: same as `MT5_AGENT_TOKEN` / admin setting **MT5 Agent Token**
@@ -207,6 +214,11 @@ attempts without touching MT5.
 
 Run it only when the scheduled `agent.py` jobs are idle: it connects to one
 terminal at a time and will disturb a master sync in progress.
+
+It warns when a terminal configured in `config.json` no longer exists on disk,
+rather than skipping it silently, and it will not recommend the master terminal
+(`mt5_terminal_path`) for validation even when that is the only one that connects —
+using it would log the master accounts out mid-job.
 
 If every variant fails, the terminal itself is refusing IPC:
 
