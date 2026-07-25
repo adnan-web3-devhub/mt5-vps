@@ -45,6 +45,7 @@ import time
 from pathlib import Path
 
 import MetaTrader5 as mt5
+import win_diagnostics
 from flask import Flask, jsonify, request
 
 logging.basicConfig(
@@ -271,8 +272,8 @@ def diagnose():
     report = {
         "python_64bit": sys.maxsize > 2**32,
         "mt5_package_version": getattr(mt5, "__version__", "unknown"),
-        "terminal_path": VALIDATOR_TERMINAL_PATH,
         "terminal_path_exists": bool(VALIDATOR_TERMINAL_PATH) and Path(VALIDATOR_TERMINAL_PATH).is_file(),
+        **win_diagnostics.report(VALIDATOR_TERMINAL_PATH),
     }
 
     with _mt5_lock:
@@ -280,6 +281,7 @@ def diagnose():
         report["initialize"] = ok
         if not ok:
             report["last_error"] = str(err)
+            report["hints"] = win_diagnostics.ipc_timeout_hints(VALIDATOR_TERMINAL_PATH)
         else:
             info = mt5.terminal_info()
             report["terminal_info"] = info._asdict() if info is not None else None
@@ -303,6 +305,20 @@ def _startup_checks() -> None:
     elif not Path(VALIDATOR_TERMINAL_PATH).is_file():
         logger.error("Configured terminal does not exist: %s", VALIDATOR_TERMINAL_PATH)
 
+    session = win_diagnostics.session_info()
+    logger.info(
+        "Running as %s in Windows session %s (elevated=%s)",
+        session.get("user"),
+        session.get("session_id"),
+        session.get("elevated"),
+    )
+    if session.get("session_id") == 0:
+        logger.error(
+            "Session 0 has no desktop, so terminal64.exe cannot finish starting and every "
+            "initialize() will time out. Run the validator from an interactive login instead "
+            "of as a plain Windows service."
+        )
+
     # Boot the terminal now so the first user validation isn't the one paying for it.
     threading.Thread(target=_warm_up, name="mt5-warmup", daemon=True).start()
 
@@ -314,11 +330,9 @@ def _warm_up() -> None:
             mt5.shutdown()
             logger.info("Warm-up successful: MT5 terminal is reachable.")
         else:
-            logger.error(
-                "Warm-up failed: %s. The terminal must be installed at the configured path and "
-                "running in an interactive desktop session. Check /diagnose for details.",
-                err,
-            )
+            logger.error("Warm-up failed: %s", err)
+            for hint in win_diagnostics.ipc_timeout_hints(VALIDATOR_TERMINAL_PATH):
+                logger.error("  - %s", hint)
 
 
 if __name__ == "__main__":

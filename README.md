@@ -130,17 +130,27 @@ server-side problem, never a wrong user password. Check in this order:
    actually installed a second terminal there — otherwise remove the key so it
    falls back to `mt5_terminal_path`.
 2. **Is the terminal already open and logged in?** Start it manually once, log into
-   any account, accept every first-run dialog (account wizard, EULA, update
-   prompt), and leave it running. A terminal stuck on a modal dialog never
-   answers the pipe.
+   any account with *Save account information* ticked, accept every first-run
+   dialog (account wizard, EULA, update prompt), and leave it running. A terminal
+   stuck on a modal dialog, mid-self-update, or with no saved account never
+   finishes booting and so never answers the pipe.
+   A terminal folder that was *copied* rather than installed is the usual culprit:
+   MT5 derives its data folder from the install path, so a new path means a brand
+   new profile with the account wizard waiting. Prefer running the official
+   installer a second time with a custom destination.
 3. **Is there an interactive desktop session?** `terminal64.exe` is a GUI app. Run
    the validator from an RDP session, or from Task Scheduler with *Run only when
    user is logged on* plus autologon. As a Windows service in session 0 (NSSM
    without a desktop) it will time out on every call.
 4. **Is Python 64-bit?** `python -c "import sys; print(sys.maxsize > 2**32)"` must
    print `True`.
-5. **Same Windows user?** The terminal and the validator must run under the same
-   account — the pipe is per-session.
+5. **Same session, same user, same elevation?** The pipe does not cross Windows
+   sessions. If the terminal process is alive at the right path and it still times
+   out, compare `validator_session.session_id` with the terminal's `SessionId` in
+   `/diagnose`, check the `Owner` matches, and make sure you did not start one of
+   the two "as Administrator" and the other normally.
+6. **Is the terminal new enough?** Python IPC needs build 2085 or newer;
+   `/diagnose` reports `terminal_build` from the exe.
 
 The service now logs these conditions at startup and pre-boots the terminal, so a
 misconfiguration shows up when you start it rather than on a user's first attempt.
@@ -150,9 +160,23 @@ For an on-demand check, run this **on the VPS** (localhost only):
 curl http://127.0.0.1:8787/diagnose
 ```
 
-It reports Python bitness, package version, whether the terminal path exists, and
-the raw `last_error()` from a real `initialize()` call. Failed `/validate`
-responses also carry `error_code` / `error_detail` for the same reason.
+It reports Python bitness, package version, whether the terminal path exists, the
+terminal build, the Windows session/user/elevation of the validator, every live
+`terminal64.exe` with its own session, owner, elevation and open windows, the
+MetaTrader named pipes currently published, the raw `last_error()` from a real
+`initialize()` call, and a `hints` list that names the specific mismatch it can
+see. The same hints are written to the log on a failed warm-up. Failed `/validate`
+responses carry `error_code` / `error_detail`.
+
+The pipe list is the most decisive field: **no MetaTrader pipe means the terminal
+is running but never finished starting**, so no client of any kind could connect,
+and the fix is at the terminal window rather than in this service.
+
+The same checks run standalone, without Flask or a validation request:
+
+```powershell
+python win_diagnostics.py "C:\eqt\mt5-validator\terminal64.exe"
+```
 
 Timing knobs in `config.json` (defaults are sized to fit inside Laravel's 60s HTTP
 timeout — raise them together carefully):
