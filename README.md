@@ -119,6 +119,46 @@ X-Arbitrage-Signature: HMAC-SHA256(raw_body, hmac_secret)
 > with a lock; using a dedicated `validator_mt5_terminal_path` avoids clashing with
 > `agent.py sync`/`weekly`.
 
+### Troubleshooting `MT5 initialize failed: (-10005, 'IPC timeout')`
+
+The Python package could not talk to the terminal over its named pipe. It is a
+server-side problem, never a wrong user password. Check in this order:
+
+1. **Does the configured terminal exist?** `validator_mt5_terminal_path` must point
+   at a real `terminal64.exe`. The default example path
+   (`C:\Program Files\MetaTrader 5 Validator\terminal64.exe`) only exists if you
+   actually installed a second terminal there — otherwise remove the key so it
+   falls back to `mt5_terminal_path`.
+2. **Is the terminal already open and logged in?** Start it manually once, log into
+   any account, accept every first-run dialog (account wizard, EULA, update
+   prompt), and leave it running. A terminal stuck on a modal dialog never
+   answers the pipe.
+3. **Is there an interactive desktop session?** `terminal64.exe` is a GUI app. Run
+   the validator from an RDP session, or from Task Scheduler with *Run only when
+   user is logged on* plus autologon. As a Windows service in session 0 (NSSM
+   without a desktop) it will time out on every call.
+4. **Is Python 64-bit?** `python -c "import sys; print(sys.maxsize > 2**32)"` must
+   print `True`.
+5. **Same Windows user?** The terminal and the validator must run under the same
+   account — the pipe is per-session.
+
+The service now logs these conditions at startup and pre-boots the terminal, so a
+misconfiguration shows up when you start it rather than on a user's first attempt.
+For an on-demand check, run this **on the VPS** (localhost only):
+
+```powershell
+curl http://127.0.0.1:8787/diagnose
+```
+
+It reports Python bitness, package version, whether the terminal path exists, and
+the raw `last_error()` from a real `initialize()` call. Failed `/validate`
+responses also carry `error_code` / `error_detail` for the same reason.
+
+Timing knobs in `config.json` (defaults are sized to fit inside Laravel's 60s HTTP
+timeout — raise them together carefully):
+`validator_terminal_warmup_seconds`, `validator_init_timeout_ms`,
+`validator_init_attempts`, `validator_init_retry_seconds`.
+
 ## Security
 
 - Master passwords are stored encrypted in Laravel and sent to the agent only over HTTPS with Bearer token + HMAC body signature.

@@ -2,11 +2,15 @@
   "laravel_api_url": "https://your-domain.com/api/arbitrage",
   "agent_token": "your-agent-token",
   "hmac_secret": "your-hmac-secret",
-  "commission_comment_keywords": ["commission", "profit share", "profitshare", "eqt"],
+  "commission_comment_keywords": ["Fee","commission", "profit share", "profitshare", "eqt"],
   "mt5_terminal_path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
-  "validator_mt5_terminal_path": "C:\\Program Files\\MetaTrader 5 Validator\\terminal64.exe",
+  "validator_mt5_terminal_path": "C:\\eqt\\mt5-validator\\terminal64.exe",
   "validator_host": "0.0.0.0",
   "validator_port": 8787,
+  "validator_terminal_warmup_seconds": 10,
+  "validator_init_timeout_ms": 15000,
+  "validator_init_attempts": 2,
+  "validator_init_retry_seconds": 2,
   "use_laravel_accounts": true,
   "local_accounts": []
 }
